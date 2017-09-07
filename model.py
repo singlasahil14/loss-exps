@@ -9,13 +9,12 @@ from tensorflow.python.training import moving_averages
 class Network(object):
   """General layers in a neural network."""
 
-  def __init__(self, mode='train'):
+  def __init__(self):
     """Network constructor.
 
     Args:
       mode: One of 'train' and 'eval'.
     """
-    self._mode = mode
     self._nonlin_dict = {'relu': self._relu, 'selu': self._selu, 
       'maxout': self._maxout, 'identity': self._identity}
 
@@ -35,34 +34,14 @@ class Network(object):
       gamma = tf.get_variable(
           'gamma', params_shape, tf.float32,
           initializer=tf.constant_initializer(1.0, tf.float32))
-
-      if self.mode == 'train':
-        mean, variance = tf.nn.moments(x, [0, 1, 2], name='moments')
-
-        moving_mean = tf.get_variable(
-            'moving_mean', params_shape, tf.float32,
-            initializer=tf.constant_initializer(0.0, tf.float32),
-            trainable=False)
-        moving_variance = tf.get_variable(
-            'moving_variance', params_shape, tf.float32,
-            initializer=tf.constant_initializer(1.0, tf.float32),
-            trainable=False)
-
-        self._extra_train_ops.append(moving_averages.assign_moving_average(
-            moving_mean, mean, 0.9))
-        self._extra_train_ops.append(moving_averages.assign_moving_average(
-            moving_variance, variance, 0.9))
+      ndims = len(x.get_shape().as_list())
+      if ndims==2:
+          axes = [0]
+      elif ndims==4:
+          axes = [0, 1, 2]
       else:
-        mean = tf.get_variable(
-            'moving_mean', params_shape, tf.float32,
-            initializer=tf.constant_initializer(0.0, tf.float32),
-            trainable=False)
-        variance = tf.get_variable(
-            'moving_variance', params_shape, tf.float32,
-            initializer=tf.constant_initializer(1.0, tf.float32),
-            trainable=False)
-        tf.summary.histogram(mean.op.name, mean)
-        tf.summary.histogram(variance.op.name, variance)
+          raise ValueError('Undefined axes for ndims %d' % ndims)
+      mean, variance = tf.nn.moments(x, axes, name='moments')
       # epsilon used to be 1e-5. Maybe 0.001 solves NaN problem in deeper net.
       y = tf.nn.batch_normalization(
           x, mean, variance, beta, gamma, 0.001)
@@ -73,6 +52,7 @@ class Network(object):
     """Convolution."""
     def conv_fn(inp, stride, padding):
       with tf.variable_scope(name):
+        print inp.get_shape()
         in_filters = int(inp.get_shape()[-1])
         n = filter_size * filter_size * out_filters
         conv_filter = tf.get_variable(
@@ -84,12 +64,12 @@ class Network(object):
 
   def _dense(self, out_dim, name='dense'):
     """Dense layer for final output."""
-    with tf.variable_scope(name):
-      w = tf.get_variable('weights', [x.get_shape()[1], out_dim],
-            initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
-      b = tf.get_variable('biases', [out_dim],
-            initializer=tf.constant_initializer(0.0))
     def dense_fn(x):
+      with tf.variable_scope(name):
+        w = tf.get_variable('weights', [x.get_shape()[1], out_dim],
+              initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
+        b = tf.get_variable('biases', [out_dim],
+              initializer=tf.constant_initializer(0.0))
       return tf.nn.xw_plus_b(x, w, b)
     return dense_fn
 
