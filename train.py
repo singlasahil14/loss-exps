@@ -94,6 +94,7 @@ class LossMinimizer:
     model = _ClassifierModel()
     model.forward(self._images, stn=model_config.use_stn, nonlin=model_config.nonlin)
     self._embeddings = model.embeddings
+    self._embeddings = tf.nn.l2_normalize(self._embeddings, dim=1)
     self._embedding_size = self._embeddings.get_shape().as_list()[-1]
     with tf.variable_scope('logits'):
       w = tf.get_variable('weights', [self._embedding_size, self._num_classes],
@@ -106,6 +107,29 @@ class LossMinimizer:
     self._M = model_config.M
     self._extra_loss = model_config.extra_loss
     self._setup_loss()
+
+  def _amplify_cos(self, cos):
+    thetas = tf.acos(cos)
+    pi = tf.acos(-1.)
+    ks = tf.floor(self._M*(thetas/pi))
+    ks = tf.minimum(ks, self._M-1)
+    if(self._M==1):
+      amplified_cos = cos
+    elif(self._M==2):
+      amplified_cos = 2.*tf.square(cos) - 1.
+    elif(self._M==3):
+      amplified_cos = 4.*tf.square(cos) - 3.
+      amplified_cos = cos * amplified_cos
+    elif(self._M==4):
+      amplified_cos = 2*tf.square(cos) - 1.
+      amplified_cos = 2.*tf.square(amplified_cos) - 1.
+    amplified_cos = (tf.to_float(tf.pow(-1, tf.to_int32(ks)))*amplified_cos) - 2.*tf.to_float(ks)
+    return amplified_cos
+
+  def _margin_cos_thetas(self, cos_thetas, labels):
+    amplified_cos_thetas = self._amplify_cos(cos_thetas)
+    margin_cos_thetas = cos_thetas*(1-labels) + amplified_cos_thetas*labels
+    return margin_cos_thetas
 
   def _center_loss_fn(self, embeddings, labels):
     centers = tf.get_variable(name='centers', shape=[self._num_classes, self._embedding_size],
@@ -121,34 +145,45 @@ class LossMinimizer:
     return center_loss
 
   def _setup_loss(self):
+    embeddings_norm = tf.norm(self._embeddings, axis=1, keep_dims=True)
+    cos_thetas = self._logits/embeddings_norm
+    modified_cos_thetas = self._margin_cos_thetas(cos_thetas, self._labels)
+    margin_logits = embeddings_norm*modified_cos_thetas
+
     self._center_loss = self._center_loss_fn(self._embeddings, self._labels)
     self._cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=self._logits, labels=self._labels))
+    self._margin_cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=margin_logits, labels=self._labels))
 
     if self._extra_loss == 'center':
       self._total_loss = self._cross_entropy + self._center_loss
+    elif self._extra_loss == 'sphere':
+      self._total_loss = self._margin_cross_entropy
     else:
       self._total_loss = self._cross_entropy
 
-    optimizer = tf.train.AdamOptimizer()
-    self._train_step = optimizer.minimize(self._total_loss)
+    trainable_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+    optimizer = tf.train.AdamOptimizer(3e-4)
+    complete_grads, complete_vars = zip(*optimizer.compute_gradients(self._total_loss, var_list=trainable_vars))
+    self._train_step = optimizer.apply_gradients(zip(complete_grads, complete_vars))
 
     correct_prediction = tf.equal(tf.argmax(self._logits, 1), tf.argmax(self._labels, 1))
     self._accuracy = tf.reduce_mean(tf.cast(correct_prediction, 'float'))
 
-    self._tensor_names = ['cross_entropy', 'accuracy', 'center_loss']
-    self._tensors_to_fetch = [self._cross_entropy, self._accuracy, self._center_loss]
+    self._tensor_names = ['cross_entropy', 'accuracy', 'margin_cross_entropy', 'center_loss']
+    self._tensors_to_fetch = [self._cross_entropy, self._accuracy, self._margin_cross_entropy, self._center_loss]
 
   def _append_metrics(self, metrics_dict, values):
     metrics_dict['iterations'].append(self._iters)
     for name, value in zip(self._tensor_names, values):
       metrics_dict[name].append(value)
     
-  def run_optimization(self, num_epochs=500, checkpoint_iters=10, batch_size=128, result_path=None):
+  def run_optimization(self, num_epochs=100, checkpoint_iters=10, batch_size=128, result_path=None):
     train_metrics = defaultdict(list)
     test_metrics = defaultdict(list)
 
     self._sess.run(tf.global_variables_initializer())
     self._iters = 0
+    format_string = 'Iteration: %d, Cross Entropy: %f, Accuracy: %.2f, Margin Cross Entropy: %f, Center Loss: %.3f'
     for epoch_i in range(num_epochs):
       i = 0
       while i < len(self._x_train):
@@ -161,8 +196,8 @@ class LossMinimizer:
         train_values = self._sess.run([self._train_step] + self._tensors_to_fetch, feed_dict=feed_dict)
         self._append_metrics(train_metrics, train_values[1:])
         if self._iters % checkpoint_iters == 0:
-          train_cross_entropy, train_accuracy, train_center_loss = train_values[1], train_values[2], train_values[3]
-          print('Iteration: %d, Cross Entropy: %f, Accuracy: %.2f, Center Loss: %.3f' % (self._iters, train_cross_entropy, train_accuracy, train_center_loss))
+          train_cross_entropy, train_accuracy, train_margin_cross_entropy, train_center_loss = train_values[1], train_values[2], train_values[3], train_values[4]
+          print(format_string % (self._iters, train_cross_entropy, train_accuracy, train_margin_cross_entropy, train_center_loss))
         self._iters = self._iters + 1
 
       feed_dict = {self._images: self._x_test, self._labels: self._y_test}
@@ -185,9 +220,9 @@ def add_arguments(parser):
   parser.add_argument('--use-stn', default=False, help='use spatial transformer network', action='store_true')
   parser.add_argument('--nonlin', choices=['relu', 'selu', 'maxout'], default='relu', type=str, help='nonlinearity to use (default %(default)s)')
   parser.add_argument('--extra-loss', choices=['center', 'sphere'], default=None, type=str, help='extra loss to add to the total loss (default None)')
-  parser.add_argument('--LAMBDA', default=0.003, type=float, help='constant to multiply with center loss (default %(default)s)')
+  parser.add_argument('--LAMBDA', default=0.00003, type=float, help='constant to multiply with center loss (default %(default)s)')
   parser.add_argument('--ALPHA', default=0.5, type=float, help='constant to update embedding centroids (default %(default)s)')
-  parser.add_argument('--M', default=2, type=int, help='angle multiplier for sphere loss (default %(default)s)')
+  parser.add_argument('--M', choices=[1, 2, 3, 4], default=2, type=int, help='angle multiplier for sphere loss (default %(default)s)')
   parser.add_argument('--num-epochs', default=100, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--checkpoint-iters', default=10, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--batch-size', default=128, type=int, help='batch size (default %(default)s)')
