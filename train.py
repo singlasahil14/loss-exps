@@ -104,6 +104,9 @@ class LossMinimizer:
 
     self._LAMBDA = model_config.LAMBDA
     self._ALPHA = model_config.ALPHA
+    self._beta_placeholder = tf.placeholder(tf.float32, shape=())
+    self._BETA = model_config.BETA
+    self._BETA_DECAY = model_config.BETA_DECAY
     self._M = model_config.M
     self._extra_loss = model_config.extra_loss
     self._setup_loss()
@@ -148,7 +151,8 @@ class LossMinimizer:
     embeddings_norm = tf.norm(self._embeddings, axis=1, keep_dims=True)
     cos_thetas = self._logits/embeddings_norm
     modified_cos_thetas = self._margin_cos_thetas(cos_thetas, self._labels)
-    margin_logits = embeddings_norm*modified_cos_thetas
+    modified_logits = embeddings_norm*modified_cos_thetas
+    margin_logits = (modified_logits + (self._beta_placeholder*self._logits))/(1+self._beta_placeholder)
 
     self._center_loss = self._center_loss_fn(self._embeddings, self._labels)
     self._cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=self._logits, labels=self._labels))
@@ -162,9 +166,8 @@ class LossMinimizer:
       self._total_loss = self._cross_entropy
 
     trainable_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
-    optimizer = tf.train.AdamOptimizer(3e-4)
-    complete_grads, complete_vars = zip(*optimizer.compute_gradients(self._total_loss, var_list=trainable_vars))
-    self._train_step = optimizer.apply_gradients(zip(complete_grads, complete_vars))
+    optimizer = tf.train.AdamOptimizer()
+    self._train_step = optimizer.minimize(self._total_loss)
 
     correct_prediction = tf.equal(tf.argmax(self._logits, 1), tf.argmax(self._labels, 1))
     self._accuracy = tf.reduce_mean(tf.cast(correct_prediction, 'float'))
@@ -183,6 +186,7 @@ class LossMinimizer:
 
     self._sess.run(tf.global_variables_initializer())
     self._iters = 0
+    beta = self._BETA
     format_string = 'Iteration: %d, Cross Entropy: %f, Accuracy: %.2f, Margin Cross Entropy: %f, Center Loss: %.3f'
     for epoch_i in range(num_epochs):
       i = 0
@@ -192,15 +196,16 @@ class LossMinimizer:
         batch_ys = self._y_train[i: last]
         i = last
 
-        feed_dict={self._images: batch_xs, self._labels: batch_ys}
+        feed_dict={self._images: batch_xs, self._labels: batch_ys, self._beta_placeholder: beta}
         train_values = self._sess.run([self._train_step] + self._tensors_to_fetch, feed_dict=feed_dict)
         self._append_metrics(train_metrics, train_values[1:])
         if self._iters % checkpoint_iters == 0:
           train_cross_entropy, train_accuracy, train_margin_cross_entropy, train_center_loss = train_values[1], train_values[2], train_values[3], train_values[4]
           print(format_string % (self._iters, train_cross_entropy, train_accuracy, train_margin_cross_entropy, train_center_loss))
         self._iters = self._iters + 1
+      beta = beta*self._BETA_DECAY
 
-      feed_dict = {self._images: self._x_test, self._labels: self._y_test}
+      feed_dict = {self._images: self._x_test, self._labels: self._y_test, self._beta_placeholder: 0.}
       test_values = self._sess.run(self._tensors_to_fetch, feed_dict=feed_dict)
       self._append_metrics(test_metrics, test_values)
 
@@ -219,10 +224,12 @@ def add_arguments(parser):
                       help='Dataset to train the model on (default %(default)s)')
   parser.add_argument('--use-stn', default=False, help='use spatial transformer network', action='store_true')
   parser.add_argument('--nonlin', choices=['relu', 'selu', 'maxout'], default='relu', type=str, help='nonlinearity to use (default %(default)s)')
-  parser.add_argument('--extra-loss', choices=['center', 'sphere'], default=None, type=str, help='extra loss to add to the total loss (default None)')
-  parser.add_argument('--LAMBDA', default=0.00003, type=float, help='constant to multiply with center loss (default %(default)s)')
+  parser.add_argument('--extra-loss', choices=['center', 'a-softmax'], default=None, type=str, help='extra loss to add to the total loss (default None)')
+  parser.add_argument('--LAMBDA', default=0.003, type=float, help='constant to multiply with center loss (default %(default)s)')
   parser.add_argument('--ALPHA', default=0.5, type=float, help='constant to update embedding centroids (default %(default)s)')
-  parser.add_argument('--M', choices=[1, 2, 3, 4], default=2, type=int, help='angle multiplier for sphere loss (default %(default)s)')
+  parser.add_argument('--BETA', default=1000, type=float, help='constant for a-softmax loss gradient update (default %(default)s)')
+  parser.add_argument('--BETA-DECAY', default=0.1, type=float, help='decay constant for a-softmax loss gradient update (default %(default)s)')
+  parser.add_argument('--M', choices=[1, 2, 3, 4], default=2, type=int, help='angle multiplier for a-softmax loss (default %(default)s)')
   parser.add_argument('--num-epochs', default=100, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--checkpoint-iters', default=10, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--batch-size', default=128, type=int, help='batch size (default %(default)s)')
@@ -241,9 +248,9 @@ def main():
   options = parser.parse_args()
   check_arguments(options)
 
-  model_config_tuple = collections.namedtuple('Model', 'dataset use_stn nonlin extra_loss LAMBDA ALPHA M')
-  model_config = model_config_tuple(dataset=options.dataset, use_stn=options.use_stn, nonlin=options.nonlin, 
-                   extra_loss=options.extra_loss, LAMBDA=options.LAMBDA, ALPHA=options.ALPHA, M=options.M)
+  model_config_tuple = collections.namedtuple('Model', 'dataset use_stn nonlin extra_loss LAMBDA ALPHA M BETA BETA_DECAY')
+  model_config = model_config_tuple(dataset=options.dataset, use_stn=options.use_stn, nonlin=options.nonlin, extra_loss=options.extra_loss, 
+                   LAMBDA=options.LAMBDA, ALPHA=options.ALPHA, M=options.M, BETA=options.BETA, BETA_DECAY=options.BETA_DECAY)
 
   loss_minimizer = LossMinimizer(model_config, result_path=options.result_path)
   loss_minimizer.run_optimization(num_epochs=options.num_epochs, checkpoint_iters=options.checkpoint_iters, 
