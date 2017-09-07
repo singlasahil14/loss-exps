@@ -1,6 +1,5 @@
 from collections import namedtuple
 
-import numpy as np
 import tensorflow as tf
 import six
 
@@ -52,13 +51,12 @@ class Network(object):
     """Convolution."""
     def conv_fn(inp, stride, padding):
       with tf.variable_scope(name):
-        print inp.get_shape()
         in_filters = int(inp.get_shape()[-1])
         n = filter_size * filter_size * out_filters
         conv_filter = tf.get_variable(
             'DW', [filter_size, filter_size, in_filters, out_filters],
             tf.float32, initializer=tf.random_normal_initializer(
-                stddev=np.sqrt(2.0/n)))
+                stddev=tf.sqrt(2.0/n)))
         return tf.nn.conv2d(inp, conv_filter, [1, stride, stride, 1], padding)
     return conv_fn
 

@@ -5,6 +5,7 @@ import argparse, os, collections
 from model import Network
 from data_loader import load_data
 
+tf.set_random_seed(99)
 class _ClassifierModel(Network):
   def __init__(self):
     Network.__init__(self)
@@ -33,7 +34,7 @@ class _ClassifierModel(Network):
       x = self._dense_nonlin(1024, nonlin=nonlin, name='dense1')(x)
     return x
 
-  def forward(self, x, num_classes, stn=True, nonlin='relu'):
+  def forward(self, x, stn=True, nonlin='relu'):
     shape = x.get_shape().as_list()[1:]
     if(stn):
       x_transform = self._localization_network(x)
@@ -41,7 +42,6 @@ class _ClassifierModel(Network):
       x = transformer(x, x_transform, out_size)
       x = tf.reshape(x, [-1]+shape)
     self.embeddings = self._embedding_network(x, nonlin)
-    self.logits = self._dense(num_classes, name='logits')(self.embeddings)
 
   def _conv_nonlin(self, filter_size, out_filters, nonlin='identity', name='conv_nonlin'):
     """Convolution layer with non-linearity."""
@@ -78,24 +78,45 @@ class LossMinimizer:
     self._x_train, self._y_train = x_train, y_train
     self._x_test, self._y_test = x_test, y_test
 
-    num_classes = y_train.shape[1]
+    self._num_classes = y_train.shape[1]
     img_shape = list(x_train.shape[1:])
     self._images = tf.placeholder(tf.float32, [None] + img_shape)
-    self._labels = tf.placeholder(tf.float32, [None, num_classes])
+    self._labels = tf.placeholder(tf.float32, [None, self._num_classes])
 
     model = _ClassifierModel()
-    model.forward(self._images, num_classes, stn=model_config.use_stn, nonlin=model_config.nonlin)
-    self._logits = model.logits
+    model.forward(self._images, stn=model_config.use_stn, nonlin=model_config.nonlin)
     self._embeddings = model.embeddings
+    self._embedding_size = self._embeddings.get_shape().as_list()[-1]
+    with tf.variable_scope('logits'):
+      w = tf.get_variable('weights', [self._embedding_size, self._num_classes],
+            initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
+    w = tf.nn.l2_normalize(w, dim=0)
+    self._logits = tf.matmul(self._embeddings, w)
     self._setup_loss()
 
+  def _center_loss_fn(self, embeddings, labels):
+    centers = tf.get_variable(name='centers', shape=[self._num_classes, self._embedding_size],
+                              initializer=tf.random_normal_initializer(stddev=0.1), trainable=False)
+    label_indices = tf.argmax(self._labels, 1)
+    centers_batch = tf.nn.embedding_lookup(centers, label_indices)
+    center_loss = self._LAMBDA * tf.nn.l2_loss(embeddings - centers_batch)/tf.to_float(tf.shape(embeddings)[0])
+    new_centers = centers_batch - embeddings
+    labels_unique, row_indices, counts = tf.unique_with_counts(labels)
+
+    centers_update = tf.unsorted_segment_sum(new_centers, row_indices, tf.shape(labels_unique)[0])/counts
+    centers = tf.scatter_sub(centers, labels_unique, self._ALPHA*centers_update)
+    return center_loss
+
   def _setup_loss(self):
+    self._center_loss = self._center_loss_fn(self._embeddings, self._labels)
     self._cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=self._logits, labels=self._labels))
+
+    self._total_loss = self._cross_entropy
+    optimizer = tf.train.AdamOptimizer()
+    self._train_step = optimizer.minimize(self._total_loss)
+
     correct_prediction = tf.equal(tf.argmax(self._logits, 1), tf.argmax(self._labels, 1))
     self._accuracy = tf.reduce_mean(tf.cast(correct_prediction, 'float'))
-
-    optimizer = tf.train.AdamOptimizer()
-    self._train_step = optimizer.minimize(self._cross_entropy)
 
     self._tensor_names = ['cross_entropy', 'accuracy']
     self._tensors_to_fetch = [self._cross_entropy, self._accuracy]
@@ -142,13 +163,20 @@ class LossMinimizer:
       print('End of epoch %d' % epoch_i)
       print('Test Cross Entropy: %.3f, Test Accuracy: %.2f' % (test_cross_entropy, test_accuracy))
 
+DEFAULT_LAMBDA = 0.003
+DEFAULT_ALPHA = 0.5
+DEFAULT_M = 2
 def add_arguments(parser):
   parser.add_argument('--dataset', choices=['cluttered-mnist', 'fashion-mnist', 'cifar10', 'cifar100'], default='cluttered-mnist', type=str, 
                       help='Dataset to train the model on (default %(default)s)')
   parser.add_argument('--use-stn', default=False, help='use spatial transformer network', action='store_true')
   parser.add_argument('--nonlin', choices=['relu', 'selu', 'maxout'], default='relu', type=str, help='nonlinearity to use (default %(default)s)')
-  parser.add_argument('--num-epochs', default=500, type=int, help='number of epochs to run (default: %(default)s)')
-  parser.add_argument('--checkpoint-iters', default=10, type=int, help='number of epochs to run (default: %(default)s)')
+  parser.add_argument('--extra-loss', choices=['center', 'sphere'], default=None, type=str, help='extra loss to add to the total loss (default None)')
+  parser.add_argument('--LAMBDA', default=0.003, type=float, help='constant to multiply with center loss (default %(default)s)')
+  parser.add_argument('--ALPHA', default=0.5, type=float, help='constant to update embedding centroids (default %(default)s)')
+  parser.add_argument('--M', default=2, type=int, help='angle multiplier for sphere loss (default %(default)s)')
+  parser.add_argument('--num-epochs', default=200, type=int, help='number of epochs to run (default %(default)s)')
+  parser.add_argument('--checkpoint-iters', default=10, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--batch-size', default=128, type=int, help='batch size (default %(default)s)')
   parser.add_argument('--result-path', default='result', type=str, help='Directory for storing training and eval logs')
   
