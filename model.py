@@ -43,7 +43,7 @@ class Network(object):
       mean, variance = tf.nn.moments(x, axes, name='moments')
       # epsilon used to be 1e-5. Maybe 0.001 solves NaN problem in deeper net.
       y = tf.nn.batch_normalization(
-          x, mean, variance, beta, gamma, 0.001)
+          x, mean, variance, beta, gamma, 0.0001)
       y.set_shape(x.get_shape())
       return y
 

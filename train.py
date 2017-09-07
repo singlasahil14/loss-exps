@@ -1,7 +1,7 @@
 from spatial_transformer import transformer
 import numpy as np, pandas as pd, tensorflow as tf
 from collections import namedtuple, defaultdict
-import argparse, os, collections
+import argparse, os, collections, json
 from model import Network
 from data_loader import load_data
 
@@ -69,10 +69,18 @@ class _ClassifierModel(Network):
     return dense_nonlin_fn
 
 class LossMinimizer:
-  def __init__(self, model_config):
+  def __init__(self, model_config, result_path=None):
     sess_config = tf.ConfigProto()
     sess_config.gpu_options.allow_growth = True
     self._sess = tf.Session(config=sess_config)
+
+    self._result_path = result_path
+    if self._result_path is not None:
+      os.makedirs(self._result_path)
+      config_str = json.dumps(model_config._asdict())
+      config_file = os.path.join(self._result_path, 'config')
+      config_file_object = open(config_file, 'w')
+      config_file_object.write(config_str)
 
     (x_train, y_train), (x_test, y_test) = load_data(model_config.dataset)
     self._x_train, self._y_train = x_train, y_train
@@ -92,6 +100,11 @@ class LossMinimizer:
             initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
     w = tf.nn.l2_normalize(w, dim=0)
     self._logits = tf.matmul(self._embeddings, w)
+
+    self._LAMBDA = model_config.LAMBDA
+    self._ALPHA = model_config.ALPHA
+    self._M = model_config.M
+    self._extra_loss = model_config.extra_loss
     self._setup_loss()
 
   def _center_loss_fn(self, embeddings, labels):
@@ -101,9 +114,9 @@ class LossMinimizer:
     centers_batch = tf.nn.embedding_lookup(centers, label_indices)
     center_loss = self._LAMBDA * tf.nn.l2_loss(embeddings - centers_batch)/tf.to_float(tf.shape(embeddings)[0])
     new_centers = centers_batch - embeddings
-    labels_unique, row_indices, counts = tf.unique_with_counts(labels)
+    labels_unique, row_indices, counts = tf.unique_with_counts(label_indices)
 
-    centers_update = tf.unsorted_segment_sum(new_centers, row_indices, tf.shape(labels_unique)[0])/counts
+    centers_update = tf.unsorted_segment_sum(new_centers, row_indices, tf.shape(labels_unique)[0])/tf.to_float(counts)
     centers = tf.scatter_sub(centers, labels_unique, self._ALPHA*centers_update)
     return center_loss
 
@@ -111,15 +124,19 @@ class LossMinimizer:
     self._center_loss = self._center_loss_fn(self._embeddings, self._labels)
     self._cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=self._logits, labels=self._labels))
 
-    self._total_loss = self._cross_entropy
+    if self._extra_loss == 'center':
+      self._total_loss = self._cross_entropy + self._center_loss
+    else:
+      self._total_loss = self._cross_entropy
+
     optimizer = tf.train.AdamOptimizer()
     self._train_step = optimizer.minimize(self._total_loss)
 
     correct_prediction = tf.equal(tf.argmax(self._logits, 1), tf.argmax(self._labels, 1))
     self._accuracy = tf.reduce_mean(tf.cast(correct_prediction, 'float'))
 
-    self._tensor_names = ['cross_entropy', 'accuracy']
-    self._tensors_to_fetch = [self._cross_entropy, self._accuracy]
+    self._tensor_names = ['cross_entropy', 'accuracy', 'center_loss']
+    self._tensors_to_fetch = [self._cross_entropy, self._accuracy, self._center_loss]
 
   def _append_metrics(self, metrics_dict, values):
     metrics_dict['iterations'].append(self._iters)
@@ -129,7 +146,6 @@ class LossMinimizer:
   def run_optimization(self, num_epochs=500, checkpoint_iters=10, batch_size=128, result_path=None):
     train_metrics = defaultdict(list)
     test_metrics = defaultdict(list)
-    os.makedirs(result_path)
 
     self._sess.run(tf.global_variables_initializer())
     self._iters = 0
@@ -145,27 +161,24 @@ class LossMinimizer:
         train_values = self._sess.run([self._train_step] + self._tensors_to_fetch, feed_dict=feed_dict)
         self._append_metrics(train_metrics, train_values[1:])
         if self._iters % checkpoint_iters == 0:
-          loss, accuracy = train_values[1], train_values[2]
-          print('Iteration: ' + str(self._iters) + ' Loss: ' + str(loss), ' Accuracy: ' + str(accuracy))
+          train_cross_entropy, train_accuracy, train_center_loss = train_values[1], train_values[2], train_values[3]
+          print('Iteration: %d, Cross Entropy: %f, Accuracy: %.2f, Center Loss: %.3f' % (self._iters, train_cross_entropy, train_accuracy, train_center_loss))
         self._iters = self._iters + 1
 
       feed_dict = {self._images: self._x_test, self._labels: self._y_test}
       test_values = self._sess.run(self._tensors_to_fetch, feed_dict=feed_dict)
       self._append_metrics(test_metrics, test_values)
 
-      if(result_path is not None):
+      if(self._result_path is not None):
         pd_train_metrics = pd.DataFrame(train_metrics)
-        pd_train_metrics.to_csv(os.path.join(result_path, 'train_metrics.csv'))
+        pd_train_metrics.to_csv(os.path.join(self._result_path, 'train_metrics.csv'))
         pd_test_metrics = pd.DataFrame(test_metrics)
-        pd_test_metrics.to_csv(os.path.join(result_path, 'test_metrics.csv'))
+        pd_test_metrics.to_csv(os.path.join(self._result_path, 'test_metrics.csv'))
 
       test_cross_entropy, test_accuracy = test_values[0], test_values[1]
       print('End of epoch %d' % epoch_i)
       print('Test Cross Entropy: %.3f, Test Accuracy: %.2f' % (test_cross_entropy, test_accuracy))
 
-DEFAULT_LAMBDA = 0.003
-DEFAULT_ALPHA = 0.5
-DEFAULT_M = 2
 def add_arguments(parser):
   parser.add_argument('--dataset', choices=['cluttered-mnist', 'fashion-mnist', 'cifar10', 'cifar100'], default='cluttered-mnist', type=str, 
                       help='Dataset to train the model on (default %(default)s)')
@@ -175,7 +188,7 @@ def add_arguments(parser):
   parser.add_argument('--LAMBDA', default=0.003, type=float, help='constant to multiply with center loss (default %(default)s)')
   parser.add_argument('--ALPHA', default=0.5, type=float, help='constant to update embedding centroids (default %(default)s)')
   parser.add_argument('--M', default=2, type=int, help='angle multiplier for sphere loss (default %(default)s)')
-  parser.add_argument('--num-epochs', default=200, type=int, help='number of epochs to run (default %(default)s)')
+  parser.add_argument('--num-epochs', default=100, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--checkpoint-iters', default=10, type=int, help='number of epochs to run (default %(default)s)')
   parser.add_argument('--batch-size', default=128, type=int, help='batch size (default %(default)s)')
   parser.add_argument('--result-path', default='result', type=str, help='Directory for storing training and eval logs')
@@ -193,10 +206,11 @@ def main():
   options = parser.parse_args()
   check_arguments(options)
 
-  model_config_tuple = collections.namedtuple('Model', 'dataset use_stn nonlin')
-  model_config = model_config_tuple(dataset=options.dataset, use_stn=options.use_stn, nonlin=options.nonlin)
+  model_config_tuple = collections.namedtuple('Model', 'dataset use_stn nonlin extra_loss LAMBDA ALPHA M')
+  model_config = model_config_tuple(dataset=options.dataset, use_stn=options.use_stn, nonlin=options.nonlin, 
+                   extra_loss=options.extra_loss, LAMBDA=options.LAMBDA, ALPHA=options.ALPHA, M=options.M)
 
-  loss_minimizer = LossMinimizer(model_config)
+  loss_minimizer = LossMinimizer(model_config, result_path=options.result_path)
   loss_minimizer.run_optimization(num_epochs=options.num_epochs, checkpoint_iters=options.checkpoint_iters, 
                                   batch_size=options.batch_size, result_path=options.result_path)
   
