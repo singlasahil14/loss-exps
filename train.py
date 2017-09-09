@@ -1,4 +1,3 @@
-from spatial_transformer import transformer
 import numpy as np, pandas as pd, tensorflow as tf
 from collections import namedtuple, defaultdict
 import argparse, os, collections, json
